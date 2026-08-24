@@ -1,170 +1,120 @@
-# Proposal: Fine-tune + Serve a Contract-Clause Extraction Model Behind a REST API
+# Proposal: Fine-tune and Serve Contract-Clause Extraction
 
 ## 1. The Difficulty
 
-The task requires building a complete train-to-deploy ML pipeline: parameter-efficient
-fine-tuning (LoRA) of a small causal language model to extract structured fields from
-contract clauses, followed by standing up an independent, production-style FastAPI
-service that loads the *trained artifact* (not the base model) and serves it correctly
-under validation, batching, and error conditions.
+This project builds a complete machine-learning delivery pipeline for contract clauses.
+It fine-tunes a small causal language model with LoRA, then serves the trained adapter
+through a validated FastAPI REST service.
 
-The reasoning difficulty is not "can a model be trained" — it is keeping training and
-serving consistent across a process boundary. An agent has to get right, simultaneously:
+The service extracts two fields from each clause:
 
-- Prompt/format consistency. Whatever prompt template and target-JSON format the
-  model was trained on must be reproduced *exactly* at inference time, including
-  tokenizer special tokens, truncation behavior, and generation stop conditions. A
-  mismatch here doesn't crash the service — it silently degrades output quality, which
-  is a much harder failure mode to catch than a stack trace.
-- **Artifact separation.** The adapter (LoRA weights) must be saved separately from the
-  frozen base model and re-composed at serve time via `PeftModel.from_pretrained`,
-  proving the agent understands PEFT's save/load contract rather than just calling
-  `.save_pretrained()` on a merged model and hoping.
-- **Robust generation parsing.** The model emits free-form text; the API must parse it
-  into a strict JSON contract, handle truncated/malformed generations gracefully, and
-  return a deterministic typed fallback when the generation cannot be parsed.
-- **API correctness under load shape variation.** Single vs. batched inference share a
-  model but not necessarily a code path — batching has to actually batch (one forward
-  pass class, not a Python loop dressed up as batching) or the agent has to justify why
-  not, and either way every batch item must map to exactly one result in order.
-- **Operational hygiene.** Structured logging of latency/status without leaking raw
-  contract text (a privacy-adjacent constraint that's easy to overlook when you're
-  focused on making the model work).
+- `clause_type`: termination, payment_terms, confidentiality, renewal, or leave_benefits
+- `extracted_value`: the short numeric phrase copied from the clause
 
-This is exactly the job of an **ML platform / MLOps engineer** taking a data scientist's
-fine-tuning notebook and turning it into a service other teams can call — a very common
-and highly transferable real-world responsibility distinct from either pure ML research
-or pure backend work.
+The API provides single extraction, genuine batched extraction, health reporting,
+input validation, structured logging, and privacy protection.
 
-**Data.** The dataset is synthetic contract clauses generated from five clause-type
-template families (termination, payment_terms, confidentiality, renewal,
-leave_benefits), each with randomized party names, section numbers, boilerplate filler
-sentences, and a randomized numeric value embedded in a fixed unit phrase (e.g. "45
-days"). Synthetic data is the right choice here because (a) real contracts are
-confidential and licensing-encumbered, and (b) the task is evaluating the *engineering
-pipeline*, not novel clause-understanding capability — the template family gives a
-learnable, well-defined ground truth needed for deterministic grading. It is realistically
-challenging in the sense that matters for this task: the surface text varies substantially
-(different parties, section numbers, filler sentences, phrasing order) around the signal,
-so the model must actually learn the association between keywords and clause_type/value
-rather than pattern-match a fixed string, and the held-out evaluation set uses a
-disjoint value range and a different random seed than the training set, so memorizing
-training examples verbatim does not transfer.
+The key engineering challenge is preserving one contract between training and serving.
+The prompt template, target JSON format, tokenizer settings, truncation behavior, and
+generation rules must remain consistent across separate processes.
 
-## 2. The Intended Approach
+The adapter must also remain separate from the frozen base model. Training saves LoRA
+weights independently, and serving composes them with the base model using PEFT.
+This proves that the service uses the trained artifact rather than the untouched model.
 
-**Key insight:** decouple "does the agent understand LoRA fine-tuning" from "does the
-agent understand serving a trained artifact" by making both individually inspectable —
-train.py produces artifacts on disk with a well-defined contract (adapter dir +
-tokenizer dir + a small `training_config.json` recording the prompt template used),
-and serve.py's *only* job is to correctly consume that contract. This is also why the
-prompt/target format has to be written to disk alongside the adapter rather than
-hardcoded identically in both files — it forces the agent to treat format-consistency
-as a real interface, not an accident of copy-pasting the same string twice.
+Generation is free-form, so the server extracts JSON safely from model output. Invalid
+or truncated output receives a deterministic typed fallback rather than malformed JSON.
 
-High-level pipeline:
+Batching is implemented through one tokenizer call and one `model.generate()` call.
+The results are decoded in input order, with exactly one result per valid input item.
 
-```
-environment/data/train_clauses.jsonl (baked into image, 300 records)
-        │
-        ▼
-train.py
-  - load JSONL, build instruction-style prompts:
-      "### Contract Clause:\n{text}\n### Extraction:\n{json_target}\n"
-  - tokenize with base model tokenizer (pad token = eos)
-  - LoraConfig(r=8, alpha=16, target_modules=["c_attn"], task_type=CAUSAL_LM)
-    over distilgpt2, a small causal LM that is tractable on CPU and can also use
-    CUDA when the scripts are run directly in a Colab GPU runtime
-  - HF Trainer, a handful of epochs over the small dataset
-  - save PEFT adapter + tokenizer to /app/model/adapter/
-  - save /app/model/adapter/training_config.json recording the exact prompt
-    template and generation stop string, so serve.py never has to guess it
-        │
-        ▼
-serve.py (FastAPI)
-  - on startup: load base model once, wrap with
-    PeftModel.from_pretrained(base, "/app/model/adapter")
-  - read training_config.json to reconstruct the identical prompt template
-  - select CUDA automatically when available, otherwise use CPU
-  - POST /extract: validate via schemas.py, build prompt, generate, and parse JSON
-    out of the completion with a deterministic unknown-value fallback
-  - POST /extract/batch: tokenizer(..., padding=True) across the whole list in
-    one model.generate() call, then split decoded outputs back per-item
-  - GET /health: reports "ready" only once the adapter is actually loaded
-  - structured logging: one JSON line per request with timestamp, endpoint,
-    status, latency_ms, and item count — never the raw clause text itself
+Every request is logged with timestamp, endpoint, status, latency, and item count.
+Raw contract text is never written to the log, protecting potentially sensitive data.
+
+## 2. Intended Approach
+
+The synthetic dataset contains 300 labeled records, with 60 examples for each class.
+Each record includes `text`, `clause_type`, and `extracted_value`.
+
+The generator varies parties, section numbers, filler sentences, and numeric values.
+The five template families are termination, payment terms, confidentiality, renewal,
+and leave benefits.
+
+The held-out evaluation set contains 50 records created with another seed and a value
+offset of 1000. This prevents simple memorization of the training examples and tests
+generalization to unseen values, parties, and sections.
+
+The base model is `distilgpt2`, loaded from `/opt/base_model`. LoRA uses rank 8,
+alpha 16, dropout 0.05, the GPT-2 `c_attn` target module, and causal-language-model
+training. The target loss is masked so the model learns the extraction response.
+
+`train.py` loads the JSONL data and builds prompts in this form:
+
+```text
+### Contract Clause:
+{clause text}
+### Extraction:
+{target JSON}
 ```
 
-**Best-case expert time estimate:** ~4 focused hours for a senior ML platform
-engineer already fluent in HF Transformers/PEFT and FastAPI — roughly 1.5h for the
-dataset + train.py, 2h for serve.py/schemas.py including the batching and error-path
-edge cases, 30min for solution.sh/instructions.md and end-to-end smoke testing.
+It trains for six epochs and saves the adapter, tokenizer, and `training_config.json`
+to `/app/model/adapter/`. The configuration records the prompt and stop string used
+by both stages, preventing silent prompt drift.
+
+`serve.py` loads the base model once at startup, applies the adapter with PEFT, and
+marks `/health` ready only after loading finishes. `schemas.py` owns all Pydantic
+request and response validation.
+
+The server accepts text from 1 to 2000 characters. Batch requests accept 1 to 32
+items. Invalid input returns HTTP 422. Successful responses contain exactly the
+documented fields and a confidence value from 0 to 1.
+
+The scripts select CUDA automatically when a CUDA-enabled PyTorch installation exists;
+otherwise they use CPU. The Docker image intentionally installs CPU-only PyTorch.
+For Colab GPU execution, install CUDA-enabled PyTorch and run the scripts directly.
+
+The Dockerfile installs the pinned Python dependencies, downloads `distilgpt2` into
+`/opt/base_model`, copies the training data, and creates the application directories.
+
+The complete reproduction script is `/app/solution.sh`. It trains the model, starts
+the API in the background, waits for `/health`, and sends sample single and batch
+requests.
+
+The normal workflow is:
+
+1. Build the image from `environment/`.
+2. Run the solution pipeline or copy the source files into `/app`.
+3. Run `python3 /app/train.py`.
+4. Start `python3 /app/serve.py` on port 8000.
+5. Open `/docs` or call the REST endpoints with curl.
+
+For local browser access, publish the container port with `-p 8000:8000`.
+The interactive documentation is then available at `http://localhost:8000/docs`.
 
 ## 3. How It Will Be Verified
 
-Verification is a mix of artifact/schema checks (fast, always deterministic) and a
-functional accuracy check against a held-out set (has a tolerance band, explained
-below).
+`tests/test_outputs.py` verifies required files, adapter structure, API readiness,
+response schemas, validation errors, batch count, batch ordering, accuracy, and logs.
 
-The agent must produce, under `/app`:
+The required accuracy thresholds are 0.70 for `clause_type` and 0.50 for
+`extracted_value` across all 50 held-out records.
 
-- `/app/train.py`, `/app/serve.py`, `/app/schemas.py`, `/app/solution.sh`,
-  `/app/instructions.md`
-- `/app/model/adapter/` containing the saved LoRA adapter + tokenizer +
-  `training_config.json`
-- A running (or independently re-startable via `serve.py`) FastAPI service on a
-  fixed port, and `/app/logs/api.log` containing structured request logs
+The logging test requires valid JSON lines containing status and latency fields and
+checks that held-out clause text never appears verbatim in `api.log`.
 
-The verifier (`tests/test_outputs.py`) independently starts the service by importing
-`serve.py`'s app (it does **not** trust or execute the agent's `solution.sh`) and checks:
+The tested implementation passed all 14 verifier tests. Training completed in about
+13 minutes in the CPU container, and the API returned ready status with the adapter
+loaded. A sample termination request returned `termination` and `30 days`.
 
-1. All five required files exist under `/app`.
-2. `/app/model/adapter/` exists and is loadable as a PEFT adapter (schema/file check,
-   not a trust-the-agent check).
-3. `GET /health` returns `200` with a `status` field indicating the adapter is loaded.
-4. `POST /extract` on a valid clause returns `200` with exactly the keys
-   `clause_type`, `extracted_value`, `confidence` (types checked: str, str, float in
-   [0,1]).
-5. `POST /extract/batch` with N inputs returns exactly N results, in input order
-   (checked via a per-item marker embedded in each synthetic input).
-6. `POST /extract` with empty text, and a batch exceeding the documented size limit,
-   both return `422`, not `200` or `500`.
-7. **Accuracy band:** running all 50 held-out records from `tests/eval_clauses.jsonl`
-   (generated with a disjoint seed and a disjoint numeric-value range from the training
-   set — see Section 1) through `/extract`, `clause_type` exact-match accuracy must be
-   **≥ 0.70** and `extracted_value` exact-match accuracy must be **≥ 0.50**.
-   *Why a band, not an exact number:* LoRA training on a tiny CPU-friendly model has
-   run-to-run variance even with a fixed seed (nondeterministic kernels, floating-point
-   reduction order), so demanding a specific accuracy value would make the task flaky
-   through no fault of the agent's engineering. The band is calibrated so that (a) the
-   reference solution clears it comfortably and repeatably (typically ≥0.9 clause_type
-   accuracy), (b) a no-op agent, an agent that hardcodes a single label, or an agent
-   that serves the *untuned* base model (i.e., skipped fine-tuning entirely) scores at
-   or near random-chance/near-zero and fails, and (c) the band rejects "wrong method"
-   (no real fine-tuning happened) while tolerating "right method, unlucky training run."
-8. `api.log` contains one JSON object per request with `status` and `latency_ms` keys,
-   and does **not** contain the raw clause text of any held-out example verbatim
-   (privacy-logging check).
+## 4. Category and Value Justification
 
-`tests/test.sh` runs the standard pytest suite and writes `1`/`0` to
-`/logs/verifier/reward.txt` based on the exit code; it installs nothing (all
-dependencies — `torch`, `transformers`, `peft`, `fastapi`, `httpx`, `pytest` — are baked
-into `environment/Dockerfile`, shared by agent and verifier).
+The repository provides `train.py`, `serve.py`, `schemas.py`, `solution.sh`,
+`instructions.md`, the Docker environment, deterministic datasets, and tests.
 
-The Docker image uses the CPU-only PyTorch wheel. The Python scripts automatically use
-CUDA when available, so Colab GPU execution requires a CUDA-enabled PyTorch install and
-running the scripts directly rather than using this CPU-only image.
+This is an ML platform and API integration project rather than only a model exercise.
+It demonstrates parameter-efficient fine-tuning, artifact management, reproducible
+training, production-style inference, batching, validation, observability, privacy,
+and independent functional verification.
 
-## 4. Category & Sub-category Justification
-
-This task belongs to **Fine-tuning + API Integration** (not "pure fine-tuning" and not
-"pure backend API") because neither half is gradable in isolation and success requires
-correctly bridging them: a perfectly-trained adapter that `serve.py` fails to load
-correctly scores the same as no training at all (fails the accuracy band, since /extract
-would be answering from an untuned or broken model), and a beautifully-built FastAPI
-service that generates from the base model instead of the adapter equally fails. The
-verifier is deliberately structured so the accuracy check is a *joint* function of
-training quality and serving correctness — you cannot pass by faking either stage. That
-joint dependency, plus the presence of both a genuine PEFT training loop and a genuine
-multi-endpoint validated REST API with batching/logging/error-handling, is what
-distinguishes this from a single-category ML or backend task.
+The design is suitable for CPU execution and can be accelerated in Colab or another
+CUDA environment without changing the model-training or API contract.
