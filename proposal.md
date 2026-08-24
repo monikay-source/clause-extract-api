@@ -8,10 +8,10 @@ contract clauses, followed by standing up an independent, production-style FastA
 service that loads the *trained artifact* (not the base model) and serves it correctly
 under validation, batching, and error conditions.
 
-The reasoning difficulty is not "can a model be trained" — it is **keeping training and
-serving consistent across a process boundary**. An agent has to get right, simultaneously:
+The reasoning difficulty is not "can a model be trained" — it is keeping training and
+serving consistent across a process boundary. An agent has to get right, simultaneously:
 
-- **Prompt/format consistency.** Whatever prompt template and target-JSON format the
+- Prompt/format consistency. Whatever prompt template and target-JSON format the
   model was trained on must be reproduced *exactly* at inference time, including
   tokenizer special tokens, truncation behavior, and generation stop conditions. A
   mismatch here doesn't crash the service — it silently degrades output quality, which
@@ -22,7 +22,7 @@ serving consistent across a process boundary**. An agent has to get right, simul
   `.save_pretrained()` on a merged model and hoping.
 - **Robust generation parsing.** The model emits free-form text; the API must parse it
   into a strict JSON contract, handle truncated/malformed generations gracefully, and
-  never return a 200 with garbage in the response body.
+  return a deterministic typed fallback when the generation cannot be parsed.
 - **API correctness under load shape variation.** Single vs. batched inference share a
   model but not necessarily a code path — batching has to actually batch (one forward
   pass class, not a Python loop dressed up as batching) or the agent has to justify why
@@ -73,9 +73,8 @@ train.py
       "### Contract Clause:\n{text}\n### Extraction:\n{json_target}\n"
   - tokenize with base model tokenizer (pad token = eos)
   - LoraConfig(r=8, alpha=16, target_modules=["c_attn"], task_type=CAUSAL_LM)
-    over a small causal LM (e.g. distilgpt2 — small enough to fine-tune on CPU
-    in minutes, while still requiring a genuine PEFT integration; a larger
-    instruction model such as Phi-3-mini is a drop-in swap given a GPU)
+    over distilgpt2, a small causal LM that is tractable on CPU and can also use
+    CUDA when the scripts are run directly in a Colab GPU runtime
   - HF Trainer, a handful of epochs over the small dataset
   - save PEFT adapter + tokenizer to /app/model/adapter/
   - save /app/model/adapter/training_config.json recording the exact prompt
@@ -86,14 +85,14 @@ serve.py (FastAPI)
   - on startup: load base model once, wrap with
     PeftModel.from_pretrained(base, "/app/model/adapter")
   - read training_config.json to reconstruct the identical prompt template
-  - POST /extract: validate via schemas.py, build prompt, generate, parse JSON
-    out of the completion (regex/greedy-JSON-extraction with a fallback that
-    returns a typed error rather than a 200 with null fields)
+  - select CUDA automatically when available, otherwise use CPU
+  - POST /extract: validate via schemas.py, build prompt, generate, and parse JSON
+    out of the completion with a deterministic unknown-value fallback
   - POST /extract/batch: tokenizer(..., padding=True) across the whole list in
     one model.generate() call, then split decoded outputs back per-item
   - GET /health: reports "ready" only once the adapter is actually loaded
   - structured logging: one JSON line per request with timestamp, endpoint,
-    status, latency_ms, and len(text) — never the raw clause text itself
+    status, latency_ms, and item count — never the raw clause text itself
 ```
 
 **Best-case expert time estimate:** ~4 focused hours for a senior ML platform
@@ -147,10 +146,14 @@ The verifier (`tests/test_outputs.py`) independently starts the service by impor
    and does **not** contain the raw clause text of any held-out example verbatim
    (privacy-logging check).
 
-`tests/test.sh` runs pytest with `--ctrf` output and writes `1`/`0` to
+`tests/test.sh` runs the standard pytest suite and writes `1`/`0` to
 `/logs/verifier/reward.txt` based on the exit code; it installs nothing (all
 dependencies — `torch`, `transformers`, `peft`, `fastapi`, `httpx`, `pytest` — are baked
 into `environment/Dockerfile`, shared by agent and verifier).
+
+The Docker image uses the CPU-only PyTorch wheel. The Python scripts automatically use
+CUDA when available, so Colab GPU execution requires a CUDA-enabled PyTorch install and
+running the scripts directly rather than using this CPU-only image.
 
 ## 4. Category & Sub-category Justification
 
