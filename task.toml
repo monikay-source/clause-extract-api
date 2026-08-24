@@ -1,0 +1,93 @@
+artifacts = [
+  "/app/train.py",
+  "/app/serve.py",
+  "/app/schemas.py",
+  "/app/solution.sh",
+  "/app/instructions.md",
+  "/app/model/adapter",
+  "/app/logs/api.log",
+]
+
+[task]
+name = "dynamo/clause-extract-api"
+description = "Fine-tune a small LM with LoRA to extract clause_type/value from contract text, then serve it via a validated, batched FastAPI REST API."
+
+[metadata]
+# --- Pre-seeded by the Dynamo team in a real repo — left as placeholders here ---
+category = ""
+subcategory = ""
+
+# --- Fixed for this dataset ---
+model_tested = "GPT-5.4"
+agent_tested = "Terminus-2"
+
+# --- Filled in for this task ---
+# NOTE: chosen to best match the described taxonomy shape; verify against the
+# actual .dynamo/diversity-taxonomy.toml in the real repo and adjust labels if needed.
+task_objective = ["fine_tune_model", "build_api", "integrate_pipeline"]
+artifact_type = ["codebase", "trained_model_adapter", "rest_api"]
+expert_time_estimate_hours = 4
+
+difficulty_explanation = """
+The task requires keeping a fine-tuning stage and a serving stage consistent across a
+process boundary: prompt/target format, tokenizer behavior, and adapter-vs-base-model
+composition must match exactly between train.py and serve.py, or output quality silently
+degrades rather than erroring. The agent must also implement genuine batched inference
+(not a disguised loop), parse free-form model generations into a strict JSON contract
+without ever returning malformed output, and log request metadata without leaking raw
+contract text. This mirrors the real responsibility of an ML platform engineer turning a
+fine-tuned model into a production inference service. The dataset is synthetic contract
+clauses built from five template families with randomized parties, section numbers, and
+filler text around a numeric value; the held-out evaluation set uses a disjoint value
+range and random seed from the training set, so verbatim memorization does not transfer
+and the agent must produce a model that actually generalizes the clause_type/value
+association.
+"""
+
+solution_explanation = """
+Decouple training and serving via an explicit on-disk contract: train.py builds
+instruction-style prompts from the labeled JSONL dataset, LoRA-tunes a small causal LM
+(e.g. distilgpt2, CPU-tractable; a larger instruction model such as Phi-3-mini is a
+drop-in swap given a GPU), and saves the adapter, tokenizer, and the exact prompt
+template/stop condition used (so serve.py never has to guess it) to /app/model/adapter/.
+serve.py loads the frozen base model once at startup, composes it with the saved adapter
+via PEFT, reconstructs the identical prompt template, and exposes /health, /extract, and
+/extract/batch through FastAPI with Pydantic-validated schemas defined in schemas.py.
+Batch requests are padded and run through generate() in a single forward pass rather
+than looped. Every request is logged as one structured JSON line with latency and status
+but never raw clause text. solution.sh and instructions.md are the human-facing
+reproduction path on top of the same two scripts.
+"""
+
+verification_explanation = """
+The verifier does not trust or execute the agent's solution.sh; it independently checks
+required files exist, that /app/model/adapter is a loadable PEFT adapter, and starts
+serve.py's app directly. It asserts GET /health reports readiness, that /extract and
+/extract/batch return exactly the documented response schema and correct item count/
+ordering, and that invalid input (empty text, oversized batch) returns 422 rather than
+200/500. Functional accuracy is checked by running all 50 records of a held-out
+tests/eval_clauses.jsonl (disjoint seed and numeric-value range from the training data)
+through /extract and requiring clause_type exact-match accuracy >= 0.70 and
+extracted_value exact-match accuracy >= 0.50. This is a tolerance band rather than an
+exact number because LoRA training has legitimate run-to-run variance even with a fixed
+seed; the band is calibrated so the reference solution clears it comfortably and
+repeatably while a no-op agent, a hardcoded-output agent, or an agent serving the
+untuned base model scores at or near chance and fails. Finally, api.log is checked for
+required structured fields and for the absence of raw held-out clause text (a
+privacy-logging check).
+"""
+
+[verifier]
+timeout_sec = 900.0
+
+[agent]
+timeout_sec = 5400.0
+
+[environment]
+build_timeout_sec = 1800.0
+cpus = 4
+memory_mb = 8192
+storage_mb = 20480
+gpus = 0
+allow_internet = true
+mcp_servers = []
