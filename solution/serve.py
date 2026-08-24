@@ -40,6 +40,7 @@ VALID_CLAUSE_TYPES = {
 }
 
 state = {"model": None, "tokenizer": None, "cfg": None, "ready": False}
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- structured request logging (never logs raw clause text) ---
 Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +73,7 @@ def load_model():
 
     base = AutoModelForCausalLM.from_pretrained(BASE_MODEL_PATH)
     model = PeftModel.from_pretrained(base, ADAPTER_DIR)
+    model.to(DEVICE)
     model.eval()
 
     cfg_path = Path(ADAPTER_DIR) / "training_config.json"
@@ -121,6 +123,7 @@ def run_batch_inference(texts):
     model, tokenizer, cfg = state["model"], state["tokenizer"], state["cfg"]
     prompts = [cfg["prompt_template"].format(text=t) for t in texts]
     enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256)
+    enc = {key: value.to(DEVICE) for key, value in enc.items()}
     gen = model.generate(
         **enc,
         max_new_tokens=40,

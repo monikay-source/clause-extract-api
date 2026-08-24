@@ -20,8 +20,7 @@ RUN pip install --no-cache-dir \
         uvicorn[standard]==0.30.6 \
         pydantic==2.8.2 \
         httpx==0.27.2 \
-        pytest==8.3.2 \
-        pytest-ctrf==0.3.0
+        pytest==8.3.2
 
 # --- Bake the base model into the image at build time (author-side network use;
 #     the agent needs zero internet access at inference time) ---

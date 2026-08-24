@@ -123,6 +123,7 @@ def main():
         num_train_epochs=6,
         per_device_train_batch_size=8,
         learning_rate=2e-4,
+        fp16=torch.cuda.is_available(),
         logging_steps=10,
         save_strategy="no",
         report_to=[],
